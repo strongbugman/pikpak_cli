@@ -25,7 +25,7 @@ REPORTER = {
 
 
 # ANT config
-HTTP_RETRIES = 5
+HTTP_RETRIES = 0
 HTTP_RETRY_DELAY = 5
 
 # PikPak

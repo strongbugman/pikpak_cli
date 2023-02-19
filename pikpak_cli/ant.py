@@ -1,4 +1,5 @@
 import os
+import typing
 
 import aiofiles
 from ant_nest import ant, pipelines
@@ -36,12 +37,7 @@ class Pikpak(ant.Ant):
     request_pipelines = [auth_pipeline]
     response_pipelines = [ErrorPipeline()]
 
-    account = ""
-    password = ""
-
     async def login(self, account: str = "", password: str = ""):
-        account = account or self.account
-        password = password or self.password
         res = await self.request(
             "https://user.mypikpak.com/v1/auth/signin",
             method="post",
@@ -55,11 +51,9 @@ class Pikpak(ant.Ant):
         )
         data = res.json()
         self.auth_pipeline.token = data
-        self.account = account
-        self.password = password
         return data
 
-    async def list_files(self, parent_id: str = ""):
+    async def list_files(self, parent_id: str = "") -> typing.Dict:
         params = {
             "thumbnail_size": "SIZE_LARGE",
             "limit": 0,
@@ -72,14 +66,25 @@ class Pikpak(ant.Ant):
         )
         return res.json()
 
-    async def get_file_link(self, file_id: str):
+    async def get_file_link(self, file_id: str) -> typing.Dict:
         return (
             await self.request(
                 f"https://api-drive.mypikpak.com/drive/v1/files/{file_id}",
             )
         ).json()
-    
-    async def download(self, url: str, path: str, start_at: int = 0):
+
+    async def delete_file(
+        self, file_ids: typing.List[str], trash: bool = True
+    ) -> typing.Dict:
+        url = "https://api-drive.mypikpak.com/drive/v1/files:batchDelete"
+        if trash:
+            url = "https://api-drive.mypikpak.com/drive/v1/files:batchTrash"
+
+        return (await self.request(url, method="post", json={"ids": file_ids})).json()
+
+    async def download(
+        self, url: str, path: str, start_at: int = 0, cache_size=300 * 1024 * 1024
+    ):
         if os.path.exists(path):
             return
 
@@ -91,16 +96,24 @@ class Pikpak(ant.Ant):
         if start_at:
             headers = {"Range": f"bytes={start_at}-"}
         res = await self.request(url, stream=True, headers=headers)
-        _downloaded = 0
+        downloaded = 0
         with tqdm(
-            total=int(res.headers["Content-Length"]), unit_scale=True, unit_divisor=1024, unit="B"
+            total=int(res.headers["Content-Length"]),
+            unit_scale=True,
+            unit_divisor=1024,
+            unit="B",
+            ascii=" \/>",
         ) as progress:
             progress.update(start_at)
             async with aiofiles.open(path, "wb") as f:
-                async for bs in res.aiter_bytes(10 * 1024 * 1024):
-                    await f.write(bs)
-                    progress.update(res.num_bytes_downloaded - _downloaded)
-                    _downloaded = res.num_bytes_downloaded
+                cache_bs = b""
+                async for bs in res.aiter_bytes(30 * 1024 * 1024):
+                    cache_bs += bs
+                    if len(cache_bs) >= cache_size:
+                        await f.write(cache_bs)
+                        cache_bs = b""
+                    progress.update(res.num_bytes_downloaded - downloaded)
+                    downloaded = res.num_bytes_downloaded
         os.rename(path, path[:-5])
 
     async def run(self):
