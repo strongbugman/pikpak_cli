@@ -98,14 +98,14 @@ class Pikpak(ant.Ant):
         res = await self.request(url, stream=True, headers=headers)
         downloaded = 0
         with tqdm(
+            initial=start_at,
             total=int(res.headers["Content-Length"]),
             unit_scale=True,
             unit_divisor=1024,
             unit="B",
             ascii=" \/>",
         ) as progress:
-            progress.update(start_at)
-            async with aiofiles.open(path, "wb") as f:
+            async with aiofiles.open(path, "ab" if start_at else "wb") as f:
                 cache_bs = b""
                 async for bs in res.aiter_bytes(30 * 1024 * 1024):
                     cache_bs += bs
@@ -114,6 +114,8 @@ class Pikpak(ant.Ant):
                         cache_bs = b""
                     progress.update(res.num_bytes_downloaded - downloaded)
                     downloaded = res.num_bytes_downloaded
+                if cache_bs:
+                    await f.write(cache_bs)
         os.rename(path, path[:-5])
 
     async def run(self):

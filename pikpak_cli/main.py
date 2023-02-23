@@ -11,12 +11,13 @@ import os
 import sys
 import typing
 
+import IPython
 import tenacity
 from httpx import HTTPError
 from prompt_toolkit import prompt
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.history import FileHistory
-from rich import print
+from rich import print, tree
 from rich.text import Text
 
 from pikpak_cli.ant import Pikpak
@@ -29,20 +30,10 @@ class CliException(Exception):
 @dataclasses.dataclass
 class Session:
     name: str = ".pikpak.session"
-    download_dir: str = ""
-    current_dirs: typing.List[str] = dataclasses.field(default_factory=lambda: [""])
-    current_dir_ids: typing.List[str] = dataclasses.field(default_factory=lambda: [""])
+    download_dir: str = "./"
     token: typing.Dict = dataclasses.field(default_factory=dict)
     account: str = ""
     password: str = ""
-
-    @property
-    def current_dir(self):
-        return "/".join(self.current_dirs) + "/"
-
-    @property
-    def current_dir_id(self):
-        return self.current_dir_ids[-1]
 
     def load(self):
         with open(self.name, "r") as f:
@@ -55,6 +46,85 @@ class Session:
             data = dataclasses.asdict(self)
             data["password"] = base64.b64encode(self.password.encode()).decode()
             json.dump(data, f)
+
+
+@dataclasses.dataclass
+class File:
+    source_data: typing.Dict[str, str]
+    childrens: typing.Dict[str, "File"] = dataclasses.field(default_factory=dict)
+    father: typing.Optional["File"] = None
+
+    @staticmethod
+    def size2str(num: int, suffix="B") -> str:
+        for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
+            if abs(num) < 1024.0:
+                return f"{num:3.1f}{unit}{suffix}"
+            num /= 1024.0
+        return f"{num:.1f}Yi{suffix}"
+
+    @staticmethod
+    def size2int(size: str) -> int:
+        multiples = {}
+        for i, n in enumerate(["", "K", "M", "G", "T", "P", "E", "Z", "Y"]):
+            multiples[n] = pow(1024, i)
+
+        for n in list(multiples.keys()):
+            multiples[n + "B"] = multiples[n]
+            multiples[n + "iB"] = multiples[n]
+        for n in list(multiples.keys()):
+            multiples[n.lower()] = multiples[n]
+
+        multiple = 1
+        size_num = size
+        for n in multiples.keys():
+            if n and size.endswith(n):
+                multiple = multiples[n]
+                size_num = size.replace(n, "")
+                break
+
+        try:
+            return int(size_num) * multiple
+        except ValueError:
+            raise CliException(f"Wrong size: {size}")
+
+    @property
+    def name(self) -> str:
+        return self.source_data.get("name")
+
+    @property
+    def size(self) -> int:
+        return int(self.source_data.get("size", 0))
+
+    @property
+    def human_size(self) -> str:
+        return self.size2str(self.size)
+
+    @property
+    def id(self) -> str:
+        return self.source_data.get("id")
+
+    @property
+    def path(self) -> str:
+        return f"{self.father.path}/{self.name}" if self.father else self.name
+
+    @property
+    def dirs(self) -> typing.List[str]:
+        return self.father.dirs + [self.father.name] if self.father else []
+
+    @property
+    def description(self) -> str:
+        return (
+            Text(self.source_data.get("modified_time", ""), style="gray")
+            + " "
+            + Text(self.human_size, style="blue")
+            + " "
+            + Text(self.name, style="green")
+            + ("/" if self.is_floder else "")
+        )
+
+    @property
+    def is_floder(self) -> bool:
+        return "folder" in self.source_data.get("kind")
 
 
 @dataclasses.dataclass
@@ -104,68 +174,63 @@ class Commander:
             self.session.load()
         self.ant = Pikpak()
         self.ant.auth_pipeline.token = self.session.token
-        self.files = {}
+        self.root_file = File({"kind": "folder", "name": "", id: ""})
+        self.current_file = self.root_file
         self.CMDS: typing.Dict[str, Command] = {}
         asyncio.ensure_future(self.refresh_token())
 
         for f in (
             self.login,
             self.exit,
+            self.shell,
             self.ls,
             self.cd,
             self.download,
             self.pwd,
             self.du,
             self.help,
-            self.set_download_dir,
+            self.config,
             self.info,
             self.rm,
         ):
             cmd = Command(f)
             self.CMDS[cmd.name] = cmd
 
-    def size2str(self, num: int, suffix="B") -> str:
-        for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
-            if abs(num) < 1024.0:
-                return f"{num:3.1f}{unit}{suffix}"
-            num /= 1024.0
-        return f"{num:.1f}Yi{suffix}"
+    async def fetch_file_childen(self, file: File) -> typing.Dict[str, File]:
+        if not file.childrens:
+            file.childrens = {
+                f["name"]: File(f, father=file)
+                for f in (await self.ant.list_files(parent_id=file.id))["files"]
+            }
+        return file.childrens
 
-    def size2int(self, size: str) -> int:
-        multiples = {}
-        for i, n in enumerate(["", "K", "M", "G", "T", "P", "E", "Z", "Y"]):
-            multiples[n] = pow(1024, i)
+    async def find_file(self, file: File, name: str) -> File:
+        for n in name.split("/"):
+            if n == "/":
+                file = self.root_file
+            elif n == ".":
+                continue
+            elif n == "..":
+                file = file.father if file.father else file
+            elif n not in await self.fetch_file_childen(file):
+                raise CliException(f"{name} not found")
+            else:
+                file = file.childrens[n]
 
-        for n in list(multiples.keys()):
-            multiples[n + "B"] = multiples[n]
-            multiples[n + "iB"] = multiples[n]
-        for n in list(multiples.keys()):
-            multiples[n.lower()] = multiples[n]
+        return file
 
-        multiple = 1
-        size_num = size
-        for n in multiples.keys():
-            if n and size.endswith(n):
-                multiple = multiples[n]
-                size_num = size.replace(n, "")
-                break
+    async def traverse_files(
+        self, file: File, recursion: bool = True
+    ) -> typing.AsyncGenerator[File, None]:
+        if not file.is_floder:
+            yield file
+            return
 
-        try:
-            return int(size_num) * multiple
-        except ValueError:
-            raise CliException(f"Wrong size: {size}")
-
-    async def traverse_files(self) -> dict:
-        if not self.files:
-            await self._ls()
-
-        for f in self.files.values():
-            if "folder" in f["kind"]:
-                await self.cd(f["name"])
-                async for f in self.traverse_files():
-                    yield f
-                await self.cd("..")
+        for f in (await self.fetch_file_childen(file)).values():
             yield f
+            if f.is_floder and recursion:
+                async for _f in self.traverse_files(f):
+                    yield _f
 
     def exec(self, input: str):
         if not input:
@@ -202,10 +267,12 @@ class Commander:
         except HTTPError as e:
             print("http error:", Text(str(e), style="red"))
 
+    def shell(self):
+        IPython.embed(header=f"Shell:\n", using="asyncio")
+
     def info(self):
         """Print session info"""
         print(Text(f"Current account: {self.session.account}", style="blue"))
-        print(Text(f"Current dir: {self.session.current_dir}", style="blue"))
         print(Text(f"Default download dir: {self.session.download_dir}", style="blue"))
         print(Text(f"session file: {self.session.name}", style="blue"))
 
@@ -214,10 +281,10 @@ class Commander:
         for c in self.CMDS.values():
             print(c.help_text)
 
-    def set_download_dir(self, dir: str):
-        """Set default download dir"""
-        os.makedirs(dir, exist_ok=True)
-        self.session.download_dir = dir
+    def config(self, downlaod_dir: str = ""):
+        """Set default download dir or"""
+        os.makedirs(downlaod_dir, exist_ok=True)
+        self.session.download_dir = downlaod_dir
 
     async def login(self, account: str, password: str = "", _echo: bool = True):
         """Login account"""
@@ -243,101 +310,55 @@ class Commander:
                         _echo=False,
                     )
 
-    async def _ls(self):
-        self.files = {
-            f["name"]: f
-            for f in (await self.ant.list_files(parent_id=self.session.current_dir_id))[
-                "files"
-            ]
-        }
-
-    async def ls(self, without_audit: bool = False, trash: bool = False):
+    async def ls(
+        self,
+        name: str,
+        without_audit: bool = False,
+        trash: bool = False,
+        recursion: bool = False,
+    ):
         """List current dir files"""
-        await self._ls()
-        for f in self.files.values():
-            if f.get("trashed") and not trash:
+        file = await self.find_file(self.current_file, name)
+        root_tree = tree.Tree(file.description)
+        trees = {file.id: root_tree}
+        async for f in self.traverse_files(file, recursion=recursion):
+            if f.source_data.get("trashed") and not trash:
                 continue
-            if f.get("audit") and without_audit:
+            if f.source_data.get("audit") and without_audit:
                 continue
-            print(
-                Text(f["modified_time"], style="gray")
-                + " "
-                + Text(self.size2str(int(f["size"])), style="blue")
-                + " "
-                + Text(f["name"], style="green")
-                + ("/" if "folder" in f["kind"] else "")
-            )
+            t = trees[f.father.id]
+            trees[f.id] = t.add(f.description)
+
+        print(root_tree)
 
     def pwd(self):
         """Get current path"""
-        print(Text(self.session.current_dir, style="green"))
+        print(Text(self.current_file.path, style="green"))
 
     async def cd(self, name: str):
         """Change directory"""
-        if not self.files:
-            await self._ls()
+        file = await self.find_file(self.current_file, name)
+        if not file.is_floder:
+            raise CliException(f"{name} is not a floder")
 
-        if name == ".":
-            return
-        if name == "/":
-            self.session.current_dir_ids = [""]
-            self.session.current_dirs = [""]
-            self.session.save()
-            await self._ls()
-            return
-        if name == "..":
-            if len(self.session.current_dir_ids) == 1:
-                print("in root dir!")
-                return
-            self.session.current_dir_ids.pop()
-            self.session.current_dirs.pop()
-            self.session.save()
-            await self._ls()
-            return
-
-        if name not in self.files:
-            print(f"wrong name: {name}")
-            return
-        if "folder" not in self.files[name]["kind"]:
-            print("not a folder!")
-            return
-
-        self.session.current_dir_ids.append(self.files[name]["id"])
-        self.session.current_dirs.append(self.files[name]["name"])
-        self.session.save()
-        await self._ls()
+        self.current_file = file
 
     async def du(self, name: str):
         """Get files's total size"""
-        if name:
-            await self.cd(name)
+        file = await self.find_file(self.current_file, name)
 
         size = 0
-        async for f in self.traverse_files():
-            size += int(f["size"])
+        async for f in self.traverse_files(file):
+            size += f.size
 
-        print(Text("all size: ", "green"), Text(self.size2str(size), "blue"))
-
-        if name:
-            await self.cd("..")
+        print(Text("all size: ", "green"), Text(File.size2str(size), "blue"))
 
     async def rm(self, name: str, no_trash: bool = False):
-        if name == ".":
-            file = {"kind": "folder", "id": self.session.current_dir_id, "name": "."}
-        else:
-            file = self.files.get(name, {})
-        if not file:
-            print("wrong file name!")
-            return
+        file = await self.find_file(self.current_file, name)
 
-        await self.ant.delete_file([file["id"]], trash=not no_trash)
+        await self.ant.delete_file([file.id], trash=not no_trash)
+        file.father.childrens.pop(file.name)
 
-    @tenacity.retry(
-        wait=tenacity.wait_fixed(60),
-        stop=tenacity.stop_after_attempt(3 + 1),
-        retry=tenacity.retry_if_exception_type(HTTPError),
-        reraise=True,
-    )
     async def download(
         self,
         name: str,
@@ -346,84 +367,77 @@ class Commander:
         dir: str = "",
         size: str = "",
         relative_path: bool = False,
-        _dirs: typing.Sequence[str] = tuple(),
+        new_file_name: str = "",
     ):
         """Download a file or many files in a directory"""
-        if name == ".":
-            file = {"kind": "folder", "id": self.session.current_dir_id, "name": "."}
-        else:
-            file = self.files.get(name, {})
-        if not file:
-            print("wrong file name!")
-            return
-
-        if "file" in file["kind"]:
+        file = await self.find_file(self.current_file, name)
+        async for f in self.traverse_files(file):
+            if f.is_floder:
+                continue
+            if f.source_data.get("trashed"):
+                continue
             # filter
             if includes:
                 include = False
-                for p in includes.pslit(","):
-                    if fnmatch.fnmatch(name, p):
+                for p in includes.split(","):
+                    if fnmatch.fnmatch(f.name, p):
                         include = True
                         break
                 if not include:
                     print(
                         Text(
-                            f"{file['name']} ignored by pattern {p} not matched",
+                            f"{f.name} ignored by pattern {p} not matched",
                             style="green",
                         )
                     )
-                    return
+                    continue
             if excludes:
                 exclude = False
-                for p in excludes.pslit(","):
-                    if fnmatch.fnmatch(name, p):
+                for p in excludes.split(","):
+                    if fnmatch.fnmatch(f.name, p):
                         exclude = True
                         break
                 if exclude:
                     print(
                         Text(
-                            f"{file['name']} ignored by pattern {p} matched",
+                            f"{f.name} ignored by pattern {p} matched",
                             style="green",
                         )
                     )
-                    return
-            data = await self.ant.get_file_link(self.files[name]["id"])
-            if size and int(data["size"]) < self.size2int(size):
+                    continue
+            if size and f.size < File.size2int(size):
                 print(
                     Text(
-                        f"{file['name']}({self.size2str(int(data['size']))}) ignored by size limit",
+                        f"{f.name}({f.human_size}) ignored by size limit",
                         style="green",
                     )
                 )
-                return
-
+                continue
+            data = await self.ant.get_file_link(f.id)
+            # download
             if not dir:
                 dir = self.session.download_dir
+            _file_name = new_file_name
+            if not _file_name:
+                _file_name = f.name
             if relative_path:
-                filename = os.path.join(dir, name)
+                filename = os.path.join(dir, _file_name)
             else:
-                filename = os.path.join(dir, *_dirs, name)
+                filename = os.path.join(
+                    dir, *f.dirs[len(self.current_file.dirs) + 1 :], _file_name
+                )
             os.makedirs(os.path.dirname(filename), exist_ok=True)
-            print(Text(f"Downloading {name} to {filename}...", style="gray"))
-            await self.ant.download(
+            print(Text(f"Downloading {f.name} to {filename}...", style="green"))
+            await tenacity.retry(
+                wait=tenacity.wait_fixed(60),
+                stop=tenacity.stop_after_attempt(3 + 1),
+                retry=tenacity.retry_if_exception_type(HTTPError),
+                reraise=True,
+            )(self.ant.download)(
                 data["links"]["application/octet-stream"]["url"], filename
             )
-            print(Text(f"Downloaded {name} to {filename}", style="blue"))
+            print(Text(f"Downloaded {filename}", style="blue"))
             await asyncio.sleep(0.5)
-        else:
-            await self.cd(name)
-            for f in self.files.values():
-                if f.get("trashed"):
-                    continue
-                await self.download(
-                    f["name"],
-                    includes=includes,
-                    size=size,
-                    dir=dir,
-                    relative_path=relative_path,
-                    _dirs=_dirs + (name,),
-                )
-            await self.cd("..")
 
     def exit(self):
         """Exit cli"""
