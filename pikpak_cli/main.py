@@ -12,11 +12,14 @@ import sys
 import typing
 
 import IPython
+import prompt_toolkit
+import prompt_toolkit.auto_suggest
+import prompt_toolkit.buffer
+import prompt_toolkit.completion
+import prompt_toolkit.document
+import prompt_toolkit.history
 import tenacity
 from httpx import HTTPError
-from prompt_toolkit import prompt
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.history import FileHistory
 from rich import print, tree
 from rich.text import Text
 
@@ -232,34 +235,46 @@ class Commander:
                 async for _f in self.traverse_files(f):
                     yield _f
 
-    def exec(self, input: str):
+    def parse(self, input) -> typing.Tuple[typing.Optional[Command], typing.Dict]:
+        cmd = None
+        args = {}
         if not input:
-            return
+            return cmd, args
+        if input == "?":
+            input = "help"
 
-        args = input.strip().replace("?", " -h").split(" ")
-        if args[0] not in self.CMDS:
-            if input == "?":
-                self.help()
-                return
-            else:
-                print(Text("Wrong command!", style="red"))
-                return
+        _input = input.strip().split(" ")
+        if _input[0] not in self.CMDS:
+            return cmd, args
 
-        cmd = self.CMDS[args[0]]
+        cmd = self.CMDS[_input[0]]
 
-        try:
-            if len(args) == 2 and args[1] == "-h":
-                print(cmd.help_text)
-                return
-
-            ns = cmd.parser.parse_args(args=args[1:])
+        if input.endswith("-h") or input.endswith("?"):
+            return cmd, {"help": True}
+        else:
+            ns = cmd.parser.parse_args(args=input.split(" ")[1:])
             data = {}
             for k, v in ns.__dict__.items():
                 if isinstance(v, list):
                     data[k] = " ".join(v)
                 else:
                     data[k] = v
-            res = cmd.call(**data)
+        return cmd, data
+
+    def exec(self, input: str):
+        try:
+            cmd, args = self.parse(input)
+            if not cmd:
+                if not input:
+                    return
+                else:
+                    print(Text("Wrong command", style="red"))
+                    return
+            if "help" in args:
+                print(cmd.help_text)
+                return
+
+            res = cmd.call(**args)
             if asyncio.iscoroutine(res):
                 asyncio.get_event_loop().run_until_complete(res)
         except CliException as e:
@@ -268,7 +283,7 @@ class Commander:
             print("http error:", Text(str(e), style="red"))
 
     def shell(self):
-        IPython.embed(header=f"Shell:\n", using="asyncio")
+        IPython.embed(header=f"Shell:\n", using="asyncio", colors="Neutral")
 
     def info(self):
         """Print session info"""
@@ -320,6 +335,10 @@ class Commander:
         """List current dir files"""
         file = await self.find_file(self.current_file, name)
         root_tree = tree.Tree(file.description)
+        if not file.is_floder:
+            print(file.description)
+            return
+
         trees = {file.id: root_tree}
         async for f in self.traverse_files(file, recursion=recursion):
             if f.source_data.get("trashed") and not trash:
@@ -437,24 +456,73 @@ class Commander:
                 data["links"]["application/octet-stream"]["url"], filename
             )
             print(Text(f"Downloaded {filename}", style="blue"))
-            await asyncio.sleep(0.5)
 
     def exit(self):
         """Exit cli"""
         sys.exit()
 
 
+class Competer(prompt_toolkit.completion.Completer):
+    def __init__(self, commander: Commander) -> None:
+        self.commander = commander
+
+    def get_completions(
+        self, *args, **kwargs
+    ) -> typing.Iterable[prompt_toolkit.completion.Completion]:
+        return super().get_completions(*args, **kwargs)
+
+    async def get_completions_async(
+        self,
+        document: prompt_toolkit.document.Document,
+        complete_event: prompt_toolkit.completion.CompleteEvent,
+    ) -> typing.AsyncGenerator[prompt_toolkit.completion.Completion, None]:
+        try:
+            cmd, args = self.commander.parse(document.text)
+        except CliException:
+            cmd = None
+        if not complete_event.completion_requested:
+            return
+
+        if not cmd:
+            for n in self.commander.CMDS.keys():
+                if n.startswith(document.text):
+                    yield prompt_toolkit.completion.Completion(
+                        n.replace(document.text, "")
+                    )
+        else:
+            if cmd.name in ("cd", "ls", "download", "du"):
+                dir = "/".join(args["name"].split("/")[:-1]) or "."
+                file = args["name"].split("/")[-1]
+                f = await self.commander.find_file(self.commander.current_file, dir)
+                try:
+                    if file in (await self.commander.fetch_file_childen(f)).keys():
+                        next_f = await self.commander.find_file(f, file)
+                        for n in (
+                            await self.commander.fetch_file_childen(next_f)
+                        ).keys():
+                            yield prompt_toolkit.completion.Completion("/" + n)
+                    else:
+                        for n in (await self.commander.fetch_file_childen(f)).keys():
+                            if n.startswith(file):
+                                yield prompt_toolkit.completion.Completion(
+                                    n.replace(file, "")
+                                )
+                except CliException:
+                    pass
+
+
 def main():
     commander = Commander()
     commander.info()
-    print(Text("try to type help", style="green"))
+    print(Text("try typing help", style="green"))
 
     while True:
         try:
-            user_input = prompt(
+            user_input = prompt_toolkit.prompt(
                 "pikpak_cli>",
-                history=FileHistory("history.txt"),
-                auto_suggest=AutoSuggestFromHistory(),
+                history=prompt_toolkit.history.FileHistory("history.txt"),
+                auto_suggest=prompt_toolkit.auto_suggest.AutoSuggestFromHistory(),
+                completer=Competer(commander),
             )
             commander.exec(user_input)
         except KeyboardInterrupt:
