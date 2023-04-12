@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import typing
+import contextlib
 
 import IPython
 import prompt_toolkit
@@ -262,6 +263,7 @@ class Commander:
         return cmd, data
 
     def exec(self, input: str):
+        task: typing.Optional[asyncio.Future] = None
         try:
             cmd, args = self.parse(input)
             if not cmd:
@@ -276,9 +278,15 @@ class Commander:
 
             res = cmd.call(**args)
             if asyncio.iscoroutine(res):
-                asyncio.get_event_loop().run_until_complete(res)
+                task = asyncio.gather(res)
+                asyncio.get_event_loop().run_until_complete(task)
         except CliException as e:
             print("input error:", Text(str(e), style="red"))
+        except KeyboardInterrupt:
+            if task:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    asyncio.get_event_loop().run_until_complete(task)
         except HTTPError as e:
             print("http error:", Text(str(e), style="red"))
 
@@ -448,7 +456,7 @@ class Commander:
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             print(Text(f"Downloading {f.name} to {filename}...", style="green"))
             await tenacity.retry(
-                wait=tenacity.wait_fixed(60),
+                wait=tenacity.wait.wait_incrementing(),
                 stop=tenacity.stop_after_attempt(3 + 1),
                 retry=tenacity.retry_if_exception_type(HTTPError),
                 reraise=True,
