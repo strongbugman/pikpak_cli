@@ -34,7 +34,7 @@ class AuthPipeline(pipelines.Pipeline):
 
 class Pikpak(ant.Ant):
     auth_pipeline = AuthPipeline()
-    request_pipelines = [auth_pipeline]
+    request_pipelines = [auth_pipeline, pipelines.RequestRandomUserAgentPipeline()]
     response_pipelines = [ErrorPipeline()]
 
     async def login(self, account: str = "", password: str = ""):
@@ -83,7 +83,7 @@ class Pikpak(ant.Ant):
         return (await self.request(url, method="post", json={"ids": file_ids})).json()
 
     async def download(
-        self, url: str, path: str, start_at: int = 0, cache_size=300 * 1024 * 1024
+        self, url: str, path: str, start_at: int = 0, cache_size=10 * 1024 * 1024
     ):
         if os.path.exists(path):
             return
@@ -107,7 +107,7 @@ class Pikpak(ant.Ant):
         ) as progress:
             async with aiofiles.open(path, "ab" if start_at else "wb") as f:
                 cache_bs = b""
-                async for bs in res.aiter_bytes(30 * 1024 * 1024):
+                async for bs in res.aiter_bytes(5 * 1024 * 1024):
                     cache_bs += bs
                     if len(cache_bs) >= cache_size:
                         await f.write(cache_bs)

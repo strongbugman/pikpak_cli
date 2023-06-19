@@ -10,7 +10,6 @@ import json
 import os
 import sys
 import typing
-import contextlib
 
 import IPython
 import prompt_toolkit
@@ -230,7 +229,9 @@ class Commander:
             yield file
             return
 
-        for f in (await self.fetch_file_childen(file)).values():
+        for f in sorted(
+            (await self.fetch_file_childen(file)).values(), key=lambda f: f.name
+        ):
             yield f
             if f.is_floder and recursion:
                 async for _f in self.traverse_files(f):
@@ -386,6 +387,10 @@ class Commander:
         await self.ant.delete_file([file.id], trash=not no_trash)
         file.father.childrens.pop(file.name)
 
+    async def _download(self, f: File, path: str):
+        data = await self.ant.get_file_link(f.id)
+        await self.ant.download(data["links"]["application/octet-stream"]["url"], path)
+
     async def download(
         self,
         name: str,
@@ -440,7 +445,6 @@ class Commander:
                     )
                 )
                 continue
-            data = await self.ant.get_file_link(f.id)
             # download
             if not dir:
                 dir = self.session.download_dir
@@ -455,14 +459,15 @@ class Commander:
                 )
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             print(Text(f"Downloading {f.name} to {filename}...", style="green"))
-            await tenacity.retry(
-                wait=tenacity.wait.wait_incrementing(),
-                stop=tenacity.stop_after_attempt(3 + 1),
-                retry=tenacity.retry_if_exception_type(HTTPError),
-                reraise=True,
-            )(self.ant.download)(
-                data["links"]["application/octet-stream"]["url"], filename
-            )
+            if not os.path.exists(filename):
+                await tenacity.retry(
+                    wait=tenacity.wait.wait_incrementing(10, increment=20),
+                    stop=tenacity.stop_after_attempt(30),
+                    retry=tenacity.retry_if_exception_type(
+                        (HTTPError, asyncio.TimeoutError)
+                    ),
+                    reraise=True,
+                )(self._download)(f, filename)
             print(Text(f"Downloaded {filename}", style="blue"))
 
     def exit(self):
