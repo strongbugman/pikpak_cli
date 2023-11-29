@@ -58,11 +58,11 @@ class File:
     father: typing.Optional["File"] = None
 
     @staticmethod
-    def size2str(num: int, suffix="B") -> str:
+    def size2str(num: float, suffix="B") -> str:
         for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
-            if abs(num) < 1024.0:
+            if abs(num) < 1024:
                 return f"{num:3.1f}{unit}{suffix}"
-            num /= 1024.0
+            num /= 1024
         return f"{num:.1f}Yi{suffix}"
 
     @staticmethod
@@ -92,7 +92,7 @@ class File:
 
     @property
     def name(self) -> str:
-        return self.source_data.get("name")
+        return self.source_data.get("name", "")
 
     @property
     def size(self) -> int:
@@ -104,7 +104,7 @@ class File:
 
     @property
     def id(self) -> str:
-        return self.source_data.get("id")
+        return self.source_data.get("id", "")
 
     @property
     def path(self) -> str:
@@ -115,7 +115,7 @@ class File:
         return self.father.dirs + [self.father.name] if self.father else []
 
     @property
-    def description(self) -> str:
+    def description(self) -> Text:
         return (
             Text(self.source_data.get("modified_time", ""), style="gray")
             + " "
@@ -127,7 +127,7 @@ class File:
 
     @property
     def is_floder(self) -> bool:
-        return "folder" in self.source_data.get("kind")
+        return "folder" in self.source_data.get("kind", "")
 
 
 @dataclasses.dataclass
@@ -143,7 +143,7 @@ class Command:
         return (
             Text(self.name, style="gray")
             + "\n"
-            + Text(self.parser.description, style="blue")
+            + Text(self.parser.description or "", style="blue")
             + "\n"
             + Text(self.parser.format_usage(), style="green")
         )
@@ -177,7 +177,7 @@ class Commander:
             self.session.load()
         self.ant = Pikpak()
         self.ant.auth_pipeline.token = self.session.token
-        self.root_file = File({"kind": "folder", "name": "", id: ""})
+        self.root_file = File({"kind": "folder", "name": "", "id": ""})
         self.current_file = self.root_file
         self.CMDS: typing.Dict[str, Command] = {}
         asyncio.ensure_future(self.refresh_token())
@@ -354,6 +354,7 @@ class Commander:
                 continue
             if f.source_data.get("audit") and without_audit:
                 continue
+            assert f.father
             t = trees[f.father.id]
             trees[f.id] = t.add(f.description)
 
@@ -385,7 +386,8 @@ class Commander:
         file = await self.find_file(self.current_file, name)
 
         await self.ant.delete_file([file.id], trash=not no_trash)
-        file.father.childrens.pop(file.name)
+        if file.father:
+            file.father.childrens.pop(file.name)
 
     async def _download(self, f: File, path: str):
         data = await self.ant.get_file_link(f.id)
@@ -418,7 +420,7 @@ class Commander:
                 if not include:
                     print(
                         Text(
-                            f"{f.name} ignored by pattern {p} not matched",
+                            f"{f.name} ignored by include pattern {includes}",
                             style="green",
                         )
                     )
@@ -432,7 +434,7 @@ class Commander:
                 if exclude:
                     print(
                         Text(
-                            f"{f.name} ignored by pattern {p} matched",
+                            f"{f.name} ignored by exclude pattern {excludes} matched",
                             style="green",
                         )
                     )
@@ -493,10 +495,11 @@ class Competer(prompt_toolkit.completion.Completer):
             cmd, args = self.commander.parse(document.text)
         except CliException:
             cmd = None
+            args = None
         if not complete_event.completion_requested:
             return
 
-        if not cmd:
+        if not cmd or not args:
             for n in self.commander.CMDS.keys():
                 if n.startswith(document.text):
                     yield prompt_toolkit.completion.Completion(

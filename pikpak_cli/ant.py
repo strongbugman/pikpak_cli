@@ -56,7 +56,7 @@ class Pikpak(ant.Ant):
     async def list_files(self, parent_id: str = "") -> typing.Dict:
         params = {
             "thumbnail_size": "SIZE_LARGE",
-            "limit": 0,
+            "limit": 500,
         }
         if parent_id:
             params["parent_id"] = parent_id
@@ -103,7 +103,7 @@ class Pikpak(ant.Ant):
             unit_scale=True,
             unit_divisor=1024,
             unit="B",
-            ascii=" \/>",
+            ascii=" \\/>",
         ) as progress:
             async with aiofiles.open(path, "ab" if start_at else "wb") as f:
                 cache_bs = b""
